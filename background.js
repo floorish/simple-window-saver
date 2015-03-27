@@ -2,7 +2,7 @@
 
 The background page is responsible for the following:
 * keeping track of the saved state, as well as what's open.
-* retrieving, storing and updating this state in localStorage.
+* retrieving, storing and updating this state in localSessionStorage.
 * listening for window/tab events to keep our state up to date.
 * saving, opening and deleting windows actions from the popups.
 
@@ -10,84 +10,129 @@ FEATURE: omnibox support
 
 */
 
-var DEFAULT_NAME = "Window";
+var DEFAULT_NAME = "Session";
 
 /* BASIC STATE */
-// an array of the names of all saved windows
-var savedWindowNames = restoreFromLocalStorage("savedWindowNames", new Array());
+
 
 // saved windows, keyed by name
 // If the savedWindow has an id, it is currently open.
 // Each savedWindow can only correspond to one open window at any given time.
-var savedWindows = new Object();
+//var savedWindows = {};
 
 // map the ids of open windows to saved window names
 // used to respond to events
-var windowIdToName = new Object();
+var windowIdToName = {};
 
 /* EDGE CASES */
 // saved windows that aren't currently open, keyed by name
 // used to match new windows to saved windows that are still closed
-var closedWindows = new Object();
+var closedWindows = {};
 
 // Unfortunately, removing a tab doesn't give us a windowId
 // so we need to keep track of that mapping.
-var tabIdToSavedWindowId = new Object();
+var tabIdToSavedWindowId = {};
 
 // object that stores per-window flags as to whether API indicated
 // window-closing intention on tab removal
-var isWindowClosing = new Object();
+var isWindowClosing = {};
+
+var sessions = {};
 
 
-/* INIT */
+init(function() { console.log('loaded', sessions)});
+
+function init( callback ) {
+
+    getSessions( function() {
+        matchOpenSessions( callback );
+    });
 
 
-// Google Analytics
-var _gaq = _gaq || [];
-_gaq.push(['_setAccount', 'UA-18459718-1']);
-_gaq.push(['_setCustomVar', 1, 'windowCount', savedWindowNames.length, 1]);
-(function() {
-  var ga = document.createElement('script');
-  ga.type = 'text/javascript';
-  ga.async = true;
-  ga.src = 'https://www.google-analytics.com/ga.js';
-  var s = document.getElementsByTagName('script')[0]; s.parentNode.insertBefore(ga, s);
-})();
+}
 
 
-// populate savedWindows from local storage
-// as we go, try matching them to open windows
-chrome.windows.getAll({populate:true}, function(browserWindows) {
-  for (var i in savedWindowNames) {
-    var name = savedWindowNames[i];
-    var savedWindow  = restoreFromLocalStorage(name);
-    if (!savedWindow) {
-      console.error("Window " + name + " was not found in localStorage.");
-      savedWindowNames.splice(savedWindowNames.indexOf(name), 1);
-      localStorage.savedWindowNames = JSON.stringify(savedWindowNames);
-      continue;
-    }
+/*
+ * Get window/tabs data for all session names
+ */
+function getSessions(callback) {
 
-    savedWindows[name] = savedWindow;
+    // get all sessions
+    SessionStorage.get(null, function(data) {
 
-    // by default, we assume the window is closed (id is undefined)
-    delete savedWindow.id;
+        window.sessions = data;
 
-    // now, let's check if it's one of the open windows
-    for (var j in browserWindows) {
-      var browserWindow = browserWindows[j];
-      if (windowsAreEqual(browserWindow, savedWindow)) {
-        storeWindow(browserWindow, name, savedWindow.displayName);
-        markWindowAsOpen(browserWindow);
-        break;
-      }
-    }
+        // mark as closed
+        for ( var s in sessions ) {
 
-    if (!savedWindows[name].id) {
-      closedWindows[name] = savedWindows[name];
-    }
-  }
-});
+            delete sessions[s].id;
+            closedWindows[s] = sessions[s];
+
+        }
+
+        callback();
+
+    });
+
+
+
+}
+
+
+/*
+ * Check all open windows if they match a stored session
+ */
+function matchOpenSessions(callback) {
+
+    chrome.windows.getAll({ populate: true }, function(windows) {
+
+        for (var w in windows) {
+
+            for ( var s in sessions ) {
+
+                if (sessions[s].id) {
+                    // already matched
+                    break;
+                }
+
+                if ( windowsAreEqual(windows[w], sessions[s]) ) {
+
+                    //storeWindow(browserWindow, name, savedWindow.displayName);
+                    sessions[s].id = windows[w].id;
+                    markWindowAsOpen(sessions[s]);
+                    break;
+
+                }
+
+            }
+        }
+
+        callback();
+
+    });
+
+}
+
+
+/*
+ * Simple (asynchronous) function looper
+ */
+function asyncIterator(o) {
+
+    var i = -1;
+
+    var loop = function(){
+        i++;
+        if( i == o.length ){
+			o.callback();
+			return;
+		}
+        o.functionToLoop(loop, i);
+    };
+
+    loop();//init
+
+}
 
 
 // compares a current window to a saved window
@@ -95,138 +140,170 @@ chrome.windows.getAll({populate:true}, function(browserWindows) {
 // match those of the saved window, we consider them equal
 // even if the new window has more tabs
 // TODO: try disregarding query strings (might be better?)
-function windowsAreEqual(browserWindow, savedWindow) {
-  if (browserWindow.incognito) {
-    return false;
-  }
-  if (!browserWindow.tabs || !savedWindow.tabs) {
-    return false;
-  }
-  if (browserWindow.tabs.length < savedWindow.tabs.length) {
-    return false;
-  }
-  for (var i in savedWindow.tabs) {
-    if (browserWindow.tabs[i].url != savedWindow.tabs[i].url) {
-      return false;
-    }
-  }
-  return true;
-}
+function windowsAreEqual(browserWindow, session) {
 
+    if (browserWindow.incognito) {
+        return false;
+    }
+
+    if (!browserWindow.tabs || !session.tabs) {
+        return false;
+    }
+
+    if (browserWindow.tabs.length !== session.tabs.length) {
+        return false;
+    }
+
+    // check all tab urls
+    for (var t in session.tabs) {
+
+        if (browserWindow.tabs[t].url != session.tabs[t].url) {
+            return false;
+        }
+
+    }
+
+    return true;
+
+}
 
 // save a window
 // returns the saved window object
-function saveWindow(browserWindow, displayName) {
-  var displayName = (displayName == "") ? DEFAULT_NAME : displayName;
-  // handle duplicate names
-  var name = displayName;
-  var n = 0;
-  while(savedWindows[name]) {
-    name = displayName + n;
-    n++;
-  }
+function createSession(browserWindow, displayName) {
 
-  // add window to indexes
-  savedWindowNames.push(name);
-  localStorage.savedWindowNames = JSON.stringify(savedWindowNames);
+    var displayName = (displayName == "") ? DEFAULT_NAME : displayName;
 
-  storeWindow(browserWindow, name, displayName);
-  if (browserWindow.id) {
-    markWindowAsOpen(browserWindow);
-  }
+    // create unique display name
+    var name = displayName;
+    var n = 0;
+    while(sessions[name]) {
+        name = displayName + n;
+        n++;
+    }
 
-  return browserWindow;
+    // add window to indexes
+    //sessionNames.push(name);
+    //SessionStorage.store('sessionNames', sessionNames);
+
+    var session = saveSession(browserWindow, name, displayName);
+    markWindowAsOpen(session);
+
+    return browserWindow;
 }
 
 
 // store a window object
 // returns the stored window
-function storeWindow(browserWindow, name, displayName) {
-  browserWindow.name = name;
-  browserWindow.displayName = displayName;
+function saveSession(browserWindow, name, displayName) {
 
-  savedWindows[name] = browserWindow;
-  localStorage[name] = JSON.stringify(browserWindow);
+    browserWindow.name = name;
+    browserWindow.displayName = displayName;
 
-  return browserWindow;
+    sessions[name] = browserWindow;
+
+    SessionStorage.store(name, browserWindow);
+
+    return sessions[name];
+
 }
 
 
 function markWindowAsOpen(savedWindow) {
-  delete closedWindows[savedWindow.name];
-  windowIdToName[savedWindow.id] = savedWindow.name;
-  for (var i in savedWindow.tabs) {
-    tabIdToSavedWindowId[savedWindow.tabs[i].id] = savedWindow.id;
-  }
-  updateBadgeForWindow(savedWindow.id);
+
+    delete closedWindows[savedWindow.name];
+    windowIdToName[savedWindow.id] = savedWindow.name;
+
+    for (var i in savedWindow.tabs) {
+        tabIdToSavedWindowId[savedWindow.tabs[i].id] = savedWindow.id;
+    }
+
+    updateBadgeForWindow(savedWindow.id);
 }
 
 
 function markWindowAsClosed(savedWindow) {
-  delete windowIdToName[savedWindow.id];
-  closedWindows[savedWindow.name] = savedWindow;
-  delete savedWindow.id;
+
+    if ( savedWindow.id ) {
+        if ( ! isWindowClosing[savedWindow.id] ) {
+            updateBadgeForWindow(savedWindow.id);
+        }
+        delete windowIdToName[savedWindow.id];
+    }
+
+    closedWindows[savedWindow.name] = savedWindow;
+
+    delete savedWindow.id;
+
 }
 
 
 // restore a previously saved window
-function openWindow(name) {
-  chrome.tabs.getSelected(null, function(tab){
-    // if the window was opened from a new tab, close the new tab
-    if (tab.url == "chrome://newtab/") {
-      chrome.tabs.remove(tab.id);
-    }
+function openSession(name) {
 
-    // compile the raw list of urls
-    var savedWindow = savedWindows[name];
-    var urls = [];
-    for (i in savedWindow.tabs) {
-      urls[i] = savedWindow.tabs[i].url;
-    }
+    chrome.tabs.getSelected(null, function(tab){
 
-    // create a window and open the tabs in it.
-    var createData = {url: urls};
-    var callback = function (browserWindow) { onWindowOpened(savedWindow, browserWindow); };
-    chrome.windows.create(createData, callback);
-  });
+        // if the window was opened from a new tab, close the new tab
+        if (tab.url == "chrome://newtab/") {
+            chrome.tabs.remove(tab.id);
+        }
+
+        // compile the raw list of urls
+        var session = sessions[name];
+        var urls = [];
+
+        for (var i in session.tabs) {
+            urls[i] = session.tabs[i].url;
+        }
+
+        // create a window and open the tabs in it.
+        var createData = {url: urls};
+
+        var callback = function (browserWindow) {
+            onSessionOpen(session, browserWindow);
+        };
+
+        chrome.windows.create(createData, callback);
+
+    });
+
 }
 
 
 // mark a window as opened and pin tabs if necessary
-function onWindowOpened(savedWindow, browserWindow) {
-  savedWindow.id = browserWindow.id;
-  markWindowAsOpen(savedWindow);
+function onSessionOpen(session, browserWindow) {
 
-  // pinned tabs
-  for (var i in savedWindow.tabs) {
-    if (savedWindow.tabs[i].pinned) {
-      chrome.tabs.update(browserWindow.tabs[i].id, {pinned: true});
+    session.id = browserWindow.id;
+    markWindowAsOpen(session);
+
+    // pinned tabs
+    for (var i in session.tabs) {
+        if (session.tabs[i].pinned) {
+            chrome.tabs.update(browserWindow.tabs[i].id, {pinned: true});
+        }
     }
-  }
 
-  // move the window to the end of the list (so it appears at the top of the popup)
-  savedWindowNames.splice(savedWindowNames.indexOf(savedWindow.name), 1);
-  savedWindowNames[savedWindowNames.length] = savedWindow.name;
-  localStorage.savedWindowNames = JSON.stringify(savedWindowNames);
 }
 
 
-// removed a saved window
-function deleteSavedWindow(name) {
-  var savedWindow = savedWindows[name];
+function deleteSession(name) {
 
-  var id = savedWindow.id;
-  if (id) {
-    markWindowAsClosed(savedWindow);
-    updateBadgeForWindow(id);
-    for (var i in savedWindow.tabs) {
-      delete tabIdToSavedWindowId[savedWindow.tabs[i].id];
+    var session = sessions[name];
+
+    var id = session.id;
+
+    if (id) {
+        markWindowAsClosed(session);
+        updateBadgeForWindow(id);
+        for (var i in session.tabs) {
+            delete tabIdToSavedWindowId[session.tabs[i].id];
+        }
     }
-  }
 
-  delete closedWindows[savedWindow.name];
-  delete localStorage[name];
-  delete savedWindows[name];
-  savedWindowNames.splice(savedWindowNames.indexOf(name), 1);
-  localStorage.savedWindowNames = JSON.stringify(savedWindowNames);
+    delete closedWindows[name];
+    delete sessions[name];
+
+
+    //sessionNames.splice(sessionNames.indexOf(name), 1);
+    //SessionStorage.store('sessionNames', sessionNames);
+
 }
